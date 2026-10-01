@@ -471,8 +471,8 @@ struct BaseNAXFrag {
       metal::bool_constant<transpose_b>) {
     // Create Matmul descriptor
     constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        32,  // [qmm-nax fix] pair-M: M=32 (2 M-frags), N=16 — was 16,32 (swapped)
         16,
-        32,
         16,
         transpose_a,
         transpose_b,
@@ -888,6 +888,42 @@ METAL_FUNC void tile_matmad_nax(
               B.frag_at(kk, nn, tb),
               B.frag_at(kk, nn + 1, tb),
               metal::bool_constant<transpose_b>{});
+        }
+      }
+    }
+  } else if constexpr (TN == 1) {  // [qmm-nax fix] TN==1 with ODD TM (even TM is the branch above):
+    // the unpaired last M-frag is zero-padded into the pair-M mma. MPP matmul2d
+    // requires a 32-dimension, so a lone 16x16x16 frag cannot be an mma operand;
+    // the zero half accumulates into a throwaway pad fragment and is discarded
+    // (the M-boundary store clamp drops the out-of-tile rows). Was: no branch ran
+    // -> all-zero D.
+    STEEL_PRAGMA_UNROLL
+    for (short mm = 0; mm < TM; mm += 2) {
+      STEEL_PRAGMA_UNROLL
+      for (short nn = 0; nn < TN; ++nn) {
+        STEEL_PRAGMA_UNROLL
+        for (short kk = 0; kk < TK; ++kk) {
+          if (mm + 1 < TM) {
+            CTile::NAXFrag_t::mma(
+                C.frag_at(mm, nn),
+                C.frag_at(mm + 1, nn),
+                A.frag_at(mm, kk, ta),
+                A.frag_at(mm + 1, kk, ta),
+                metal::bool_constant<transpose_a>{},
+                B.frag_at(kk, nn, tb),
+                metal::bool_constant<transpose_b>{});
+          } else {
+            auto cPad = typename CTile::frag_type{};
+            auto aPad = typename ATile::frag_type{};
+            CTile::NAXFrag_t::mma(
+                C.frag_at(mm, nn),
+                cPad,
+                A.frag_at(mm, kk, ta),
+                aPad,
+                metal::bool_constant<transpose_a>{},
+                B.frag_at(kk, nn, tb),
+                metal::bool_constant<transpose_b>{});
+          }
         }
       }
     }

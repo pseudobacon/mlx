@@ -2,6 +2,7 @@
 
 #include "mlx/backend/common/quantized.h"
 #include "mlx/backend/common/broadcasting.h"
+#include <cstdlib>
 #include "mlx/backend/common/compiled.h"
 #include "mlx/backend/gpu/copy.h"
 #include "mlx/backend/metal/device.h"
@@ -834,6 +835,24 @@ void qmm_nax(
   int bm = (M <= 32) ? 32 : 64;
   int bn = 64;
   int bk = 64;
+  // [measurement hook] env-var tile overrides; unset => the stock defaults above.
+  // The 64K-swept candidate (bm=128, wm=4, wn=2) is an EXPERIMENTAL override only
+  // (MLX_QMM_BM=128 MLX_QMM_WM=4): gateup win / down parity at 64K, net ~flat, and a
+  // WM=4 global default is unsafe at M<=32 (BM=32/WM=4 => TM=0 => zero-length fragment
+  // array => Metal compile failure), so it must not be the compiled-in policy.
+  if (const char* e = std::getenv("MLX_QMM_BM")) bm = std::atoi(e);
+  if (const char* e = std::getenv("MLX_QMM_BN")) bn = std::atoi(e);
+  if (const char* e = std::getenv("MLX_QMM_BK")) bk = std::atoi(e);
+  if (const char* e = std::getenv("MLX_QMM_WM")) wm = std::atoi(e);
+  if (const char* e = std::getenv("MLX_QMM_WN")) wn = std::atoi(e);
+  // [qmm-nax guard] WN>2 (with BN<=64) selects the nax mma TN==1 path, which the
+  // stock kernel leaves partially/all-zero. Clamp to the safe max so no tile config
+  // can silently emit wrong output (the pair-N path, WN<=2, is the correct one).
+  if (wn > 2) wn = 2;
+  // [qmm-nax guard] WM must satisfy BM >= WM*16 (TM = BM/WM/16 >= 1); a degenerate
+  // combination (e.g. BM=32, WM=4 => TM=0) makes the Metal compiler reject the
+  // zero-length fragment array. Clamp WM to the max the tile can support.
+  if (wm > bm / 16) wm = std::max(1, bm / 16);
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
 
@@ -1063,6 +1082,12 @@ void qmm(
   int wn = 2;
   int bm = 32;
   int bn = 32;
+  // [measurement hook] env-var tile overrides (non-nax qmm; no BK knob). Unset
+  // => identical to stock. See benchmarks/results/prefill-gemm/ spec.
+  if (const char* e = std::getenv("MLX_QMM_BM")) bm = std::atoi(e);
+  if (const char* e = std::getenv("MLX_QMM_BN")) bn = std::atoi(e);
+  if (const char* e = std::getenv("MLX_QMM_WM")) wm = std::atoi(e);
+  if (const char* e = std::getenv("MLX_QMM_WN")) wn = std::atoi(e);
   MTL::Size group_dims(32, wn, wm);
   MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, B);
 
